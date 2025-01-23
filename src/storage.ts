@@ -1,9 +1,6 @@
-import axios from "axios"
-import { getBuildInfo } from "coder/site/src/api/api"
-import { Workspace } from "coder/site/src/api/typesGenerated"
+import { Api } from "coder/site/src/api/api"
 import { createWriteStream } from "fs"
 import fs from "fs/promises"
-import { ensureDir } from "fs-extra"
 import { IncomingMessage } from "http"
 import path from "path"
 import prettyBytes from "pretty-bytes"
@@ -16,9 +13,6 @@ import { getHeaderCommand, getHeaders } from "./headers"
 const MAX_URLS = 10
 
 export class Storage {
-  public workspace?: Workspace
-  public workspaceLogPath?: string
-
   constructor(
     private readonly output: vscode.OutputChannel,
     private readonly memento: vscode.Memento,
@@ -28,25 +22,14 @@ export class Storage {
   ) {}
 
   /**
-   * Set the URL and session token on the Axios client and on disk for the cli
-   * if they are set.
-   */
-  public async init(): Promise<void> {
-    await this.updateURL(this.getURL())
-    await this.updateSessionToken()
-  }
-
-  /**
    * Add the URL to the list of recently accessed URLs in global storage, then
-   * set it as the current URL and update it on the Axios client and on disk for
-   * the cli.
+   * set it as the last used URL.
    *
-   * If the URL is falsey, then remove it as the currently accessed URL and do
-   * not touch the history.
+   * If the URL is falsey, then remove it as the last used URL and do not touch
+   * the history.
    */
-  public async setURL(url?: string): Promise<void> {
+  public async setUrl(url?: string): Promise<void> {
     await this.memento.update("url", url)
-    this.updateURL(url)
     if (url) {
       const history = this.withUrlHistory(url)
       await this.memento.update("urlHistory", history)
@@ -54,9 +37,9 @@ export class Storage {
   }
 
   /**
-   * Get the currently configured URL.
+   * Get the last used URL.
    */
-  public getURL(): string | undefined {
+  public getUrl(): string | undefined {
     return this.memento.get("url")
   }
 
@@ -78,17 +61,20 @@ export class Storage {
     return urls.size > MAX_URLS ? Array.from(urls).slice(urls.size - MAX_URLS, urls.size) : Array.from(urls)
   }
 
-  public setSessionToken(sessionToken?: string): Thenable<void> {
+  /**
+   * Set or unset the last used token.
+   */
+  public async setSessionToken(sessionToken?: string): Promise<void> {
     if (!sessionToken) {
-      return this.secrets.delete("sessionToken").then(() => {
-        return this.updateSessionToken()
-      })
+      await this.secrets.delete("sessionToken")
+    } else {
+      await this.secrets.store("sessionToken", sessionToken)
     }
-    return this.secrets.store("sessionToken", sessionToken).then(() => {
-      return this.updateSessionToken()
-    })
   }
 
+  /**
+   * Get the last used token.
+   */
   public async getSessionToken(): Promise<string | undefined> {
     try {
       return await this.secrets.get("sessionToken")
@@ -99,9 +85,11 @@ export class Storage {
     }
   }
 
-  // getRemoteSSHLogPath returns the log path for the "Remote - SSH" output panel.
-  // There is no VS Code API to get the contents of an output panel. We use this
-  // to get the active port so we can display network information.
+  /**
+   * Returns the log path for the "Remote - SSH" output panel.  There is no VS
+   * Code API to get the contents of an output panel.  We use this to get the
+   * active port so we can display network information.
+   */
   public async getRemoteSSHLogPath(): Promise<string | undefined> {
     const upperDir = path.dirname(this.logUri.fsPath)
     // Node returns these directories sorted already!
@@ -119,25 +107,33 @@ export class Storage {
   }
 
   /**
-   * Download and return the path to a working binary.  If there is already a
-   * working binary and it matches the server version, return that, skipping the
-   * download.  Throw if unable to download a working binary.
+   * Download and return the path to a working binary for the deployment with
+   * the provided label using the provided client.  If the label is empty, use
+   * the old deployment-unaware path instead.
+   *
+   * If there is already a working binary and it matches the server version,
+   * return that, skipping the download.  If it does not match but downloads are
+   * disabled, return whatever we have and log a warning.  Otherwise throw if
+   * unable to download a working binary, whether because of network issues or
+   * downloads being disabled.
    */
-  public async fetchBinary(): Promise<string> {
-    const baseURL = this.getURL()
-    if (!baseURL) {
-      throw new Error("Must be logged in!")
-    }
-    this.output.appendLine(`Using deployment URL: ${baseURL}`)
+  public async fetchBinary(restClient: Api, label: string): Promise<string> {
+    const baseUrl = restClient.getAxiosInstance().defaults.baseURL
+
+    // Settings can be undefined when set to their defaults (true in this case),
+    // so explicitly check against false.
+    const enableDownloads = vscode.workspace.getConfiguration().get("coder.enableDownloads") !== false
+    this.output.appendLine(`Downloads are ${enableDownloads ? "enabled" : "disabled"}`)
 
     // Get the build info to compare with the existing binary version, if any,
     // and to log for debugging.
-    const buildInfo = await getBuildInfo()
+    const buildInfo = await restClient.getBuildInfo()
     this.output.appendLine(`Got server version: ${buildInfo.version}`)
 
     // Check if there is an existing binary and whether it looks valid.  If it
-    // is valid and matches the server, we can return early.
-    const binPath = this.binaryPath()
+    // is valid and matches the server, or if it does not match the server but
+    // downloads are disabled, we can return early.
+    const binPath = path.join(this.getBinaryCachePath(label), cli.name())
     this.output.appendLine(`Using binary path: ${binPath}`)
     const stat = await cli.stat(binPath)
     if (stat === undefined) {
@@ -151,12 +147,22 @@ export class Storage {
         if (version === buildInfo.version) {
           this.output.appendLine("Using existing binary since it matches the server version")
           return binPath
+        } else if (!enableDownloads) {
+          this.output.appendLine(
+            "Using existing binary even though it does not match the server version because downloads are disabled",
+          )
+          return binPath
         }
         this.output.appendLine("Downloading since existing binary does not match the server version")
       } catch (error) {
         this.output.appendLine(`Unable to get version of existing binary: ${error}`)
         this.output.appendLine("Downloading new binary instead")
       }
+    }
+
+    if (!enableDownloads) {
+      this.output.appendLine("Unable to download CLI because downloads are disabled")
+      throw new Error("Unable to download CLI because downloads are disabled")
     }
 
     // Remove any left-over old or temporary binaries.
@@ -182,9 +188,9 @@ export class Storage {
 
     // Make the download request.
     const controller = new AbortController()
-    const resp = await axios.get(binSource, {
+    const resp = await restClient.getAxiosInstance().get(binSource, {
       signal: controller.signal,
-      baseURL: baseURL,
+      baseURL: baseUrl,
       responseType: "stream",
       headers: {
         "Accept-Encoding": "gzip",
@@ -216,7 +222,7 @@ export class Storage {
         const completed = await vscode.window.withProgress<boolean>(
           {
             location: vscode.ProgressLocation.Notification,
-            title: `Downloading ${buildInfo.version} from ${axios.getUri(resp.config)} to ${binPath}`,
+            title: `Downloading ${buildInfo.version} from ${baseUrl} to ${binPath}`,
             cancellable: true,
           },
           async (progress, token) => {
@@ -345,41 +351,95 @@ export class Storage {
     }
   }
 
-  // getBinaryCachePath returns the path where binaries are cached.
-  // The caller must ensure it exists before use.
-  public getBinaryCachePath(): string {
+  /**
+   * Return the directory for a deployment with the provided label to where its
+   * binary is cached.
+   *
+   * If the label is empty, read the old deployment-unaware config instead.
+   *
+   * The caller must ensure this directory exists before use.
+   */
+  public getBinaryCachePath(label: string): string {
     const configPath = vscode.workspace.getConfiguration().get("coder.binaryDestination")
     return configPath && String(configPath).trim().length > 0
       ? path.resolve(String(configPath))
-      : path.join(this.globalStorageUri.fsPath, "bin")
+      : label
+        ? path.join(this.globalStorageUri.fsPath, label, "bin")
+        : path.join(this.globalStorageUri.fsPath, "bin")
   }
 
-  // getNetworkInfoPath returns the path where network information
-  // for SSH hosts is stored.
+  /**
+   * Return the path where network information for SSH hosts are stored.
+   *
+   * The CLI will write files here named after the process PID.
+   */
   public getNetworkInfoPath(): string {
     return path.join(this.globalStorageUri.fsPath, "net")
   }
 
-  // getLogPath returns the path where log data from the Coder
-  // agent is stored.
+  /**
+   *
+   * Return the path where log data from the connection is stored.
+   *
+   * The CLI will write files here named after the process PID.
+   */
   public getLogPath(): string {
     return path.join(this.globalStorageUri.fsPath, "log")
   }
 
+  /**
+   * Get the path to the user's settings.json file.
+   *
+   * Going through VSCode's API should be preferred when modifying settings.
+   */
   public getUserSettingsPath(): string {
     return path.join(this.globalStorageUri.fsPath, "..", "..", "..", "User", "settings.json")
   }
 
-  public getSessionTokenPath(): string {
-    return path.join(this.globalStorageUri.fsPath, "session_token")
+  /**
+   * Return the directory for the deployment with the provided label to where
+   * its session token is stored.
+   *
+   * If the label is empty, read the old deployment-unaware config instead.
+   *
+   * The caller must ensure this directory exists before use.
+   */
+  public getSessionTokenPath(label: string): string {
+    return label
+      ? path.join(this.globalStorageUri.fsPath, label, "session")
+      : path.join(this.globalStorageUri.fsPath, "session")
   }
 
-  public getURLPath(): string {
-    return path.join(this.globalStorageUri.fsPath, "url")
+  /**
+   * Return the directory for the deployment with the provided label to where
+   * its session token was stored by older code.
+   *
+   * If the label is empty, read the old deployment-unaware config instead.
+   *
+   * The caller must ensure this directory exists before use.
+   */
+  public getLegacySessionTokenPath(label: string): string {
+    return label
+      ? path.join(this.globalStorageUri.fsPath, label, "session_token")
+      : path.join(this.globalStorageUri.fsPath, "session_token")
+  }
+
+  /**
+   * Return the directory for the deployment with the provided label to where
+   * its url is stored.
+   *
+   * If the label is empty, read the old deployment-unaware config instead.
+   *
+   * The caller must ensure this directory exists before use.
+   */
+  public getUrlPath(label: string): string {
+    return label
+      ? path.join(this.globalStorageUri.fsPath, label, "url")
+      : path.join(this.globalStorageUri.fsPath, "url")
   }
 
   public writeToCoderOutputChannel(message: string) {
-    this.output.appendLine(message)
+    this.output.appendLine(`[${new Date().toISOString()}] ${message}`)
     // We don't want to focus on the output here, because the
     // Coder server is designed to restart gracefully for users
     // because of P2P connections, and we don't want to draw
@@ -387,36 +447,81 @@ export class Storage {
   }
 
   /**
-   * Set the URL on the global Axios client and write the URL to disk which will
-   * be used by the CLI via --url-file.
+   * Configure the CLI for the deployment with the provided label.
+   *
+   * Falsey URLs and null tokens are a no-op; we avoid unconfiguring the CLI to
+   * avoid breaking existing connections.
    */
-  private async updateURL(url: string | undefined): Promise<void> {
-    axios.defaults.baseURL = url
+  public async configureCli(label: string, url: string | undefined, token: string | null) {
+    await Promise.all([this.updateUrlForCli(label, url), this.updateTokenForCli(label, token)])
+  }
+
+  /**
+   * Update the URL for the deployment with the provided label on disk which can
+   * be used by the CLI via --url-file.  If the URL is falsey, do nothing.
+   *
+   * If the label is empty, read the old deployment-unaware config instead.
+   */
+  private async updateUrlForCli(label: string, url: string | undefined): Promise<void> {
     if (url) {
-      await ensureDir(this.globalStorageUri.fsPath)
-      await fs.writeFile(this.getURLPath(), url)
-    } else {
-      await fs.rm(this.getURLPath(), { force: true })
+      const urlPath = this.getUrlPath(label)
+      await fs.mkdir(path.dirname(urlPath), { recursive: true })
+      await fs.writeFile(urlPath, url)
     }
   }
 
-  private binaryPath(): string {
-    return path.join(this.getBinaryCachePath(), cli.name())
-  }
-
-  private async updateSessionToken() {
-    const token = await this.getSessionToken()
-    if (token) {
-      axios.defaults.headers.common["Coder-Session-Token"] = token
-      await ensureDir(this.globalStorageUri.fsPath)
-      await fs.writeFile(this.getSessionTokenPath(), token)
-    } else {
-      delete axios.defaults.headers.common["Coder-Session-Token"]
-      await fs.rm(this.getSessionTokenPath(), { force: true })
+  /**
+   * Update the session token for a deployment with the provided label on disk
+   * which can be used by the CLI via --session-token-file.  If the token is
+   * null, do nothing.
+   *
+   * If the label is empty, read the old deployment-unaware config instead.
+   */
+  private async updateTokenForCli(label: string, token: string | undefined | null) {
+    if (token !== null) {
+      const tokenPath = this.getSessionTokenPath(label)
+      await fs.mkdir(path.dirname(tokenPath), { recursive: true })
+      await fs.writeFile(tokenPath, token ?? "")
     }
   }
 
-  public async getHeaders(url = this.getURL()): Promise<Record<string, string>> {
+  /**
+   * Read the CLI config for a deployment with the provided label.
+   *
+   * IF a config file does not exist, return an empty string.
+   *
+   * If the label is empty, read the old deployment-unaware config.
+   */
+  public async readCliConfig(label: string): Promise<{ url: string; token: string }> {
+    const urlPath = this.getUrlPath(label)
+    const tokenPath = this.getSessionTokenPath(label)
+    const [url, token] = await Promise.allSettled([fs.readFile(urlPath, "utf8"), fs.readFile(tokenPath, "utf8")])
+    return {
+      url: url.status === "fulfilled" ? url.value.trim() : "",
+      token: token.status === "fulfilled" ? token.value.trim() : "",
+    }
+  }
+
+  /**
+   * Migrate the session token file from "session_token" to "session", if needed.
+   */
+  public async migrateSessionToken(label: string) {
+    const oldTokenPath = this.getLegacySessionTokenPath(label)
+    const newTokenPath = this.getSessionTokenPath(label)
+    try {
+      await fs.rename(oldTokenPath, newTokenPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Run the header command and return the generated headers.
+   */
+  public async getHeaders(url: string | undefined): Promise<Record<string, string>> {
     return getHeaders(url, getHeaderCommand(vscode.workspace.getConfiguration()), this)
   }
 }

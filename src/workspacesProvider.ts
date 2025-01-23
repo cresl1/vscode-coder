@@ -1,4 +1,4 @@
-import { getWorkspaces } from "coder/site/src/api/api"
+import { Api } from "coder/site/src/api/api"
 import { Workspace, WorkspaceAgent } from "coder/site/src/api/typesGenerated"
 import EventSource from "eventsource"
 import * as path from "path"
@@ -24,28 +24,38 @@ type AgentWatcher = {
   error?: unknown
 }
 
+/**
+ * Polls workspaces using the provided REST client and renders them in a tree.
+ *
+ * Polling does not start until fetchAndRefresh() is called at least once.
+ *
+ * If the poll fails or the client has no URL configured, clear the tree and
+ * abort polling until fetchAndRefresh() is called again.
+ */
 export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
-  private workspaces: WorkspaceTreeItem[] = []
+  // Undefined if we have never fetched workspaces before.
+  private workspaces: WorkspaceTreeItem[] | undefined
   private agentWatchers: Record<WorkspaceAgent["id"], AgentWatcher> = {}
   private timeout: NodeJS.Timeout | undefined
-  private visible = false
   private fetching = false
+  private visible = false
 
   constructor(
     private readonly getWorkspacesQuery: WorkspaceQuery,
+    private readonly restClient: Api,
     private readonly storage: Storage,
     private readonly timerSeconds?: number,
   ) {
-    this.fetchAndRefresh()
+    // No initialization.
   }
 
   // fetchAndRefresh fetches new workspaces, re-renders the entire tree, then
   // keeps refreshing (if a timer length was provided) as long as the user is
   // still logged in and no errors were encountered fetching workspaces.
-  // Calling this while already refreshing is a no-op and will return
-  // immediately.
+  // Calling this while already refreshing or not visible is a no-op and will
+  // return immediately.
   async fetchAndRefresh() {
-    if (this.fetching) {
+    if (this.fetching || !this.visible) {
       return
     }
     this.fetching = true
@@ -77,21 +87,24 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
    * Fetch workspaces and turn them into tree items.  Throw an error if not
    * logged in or the query fails.
    */
-  async fetch(): Promise<WorkspaceTreeItem[]> {
-    // Assume that no URL or no token means we are not logged in.
-    const url = this.storage.getURL()
-    const token = await this.storage.getSessionToken()
-    if (!url || !token) {
+  private async fetch(): Promise<WorkspaceTreeItem[]> {
+    if (vscode.env.logLevel <= vscode.LogLevel.Debug) {
+      this.storage.writeToCoderOutputChannel(`Fetching workspaces: ${this.getWorkspacesQuery || "no filter"}...`)
+    }
+
+    // If there is no URL configured, assume we are logged out.
+    const restClient = this.restClient
+    const url = restClient.getAxiosInstance().defaults.baseURL
+    if (!url) {
       throw new Error("not logged in")
     }
 
-    const resp = await getWorkspaces({ q: this.getWorkspacesQuery })
+    const resp = await restClient.getWorkspaces({ q: this.getWorkspacesQuery })
 
     // We could have logged out while waiting for the query, or logged into a
     // different deployment.
-    const url2 = this.storage.getURL()
-    const token2 = await this.storage.getSessionToken()
-    if (!url2 || !token2) {
+    const url2 = restClient.getAxiosInstance().defaults.baseURL
+    if (!url2) {
       throw new Error("not logged in")
     } else if (url !== url2) {
       // In this case we need to fetch from the new deployment instead.
@@ -117,7 +130,7 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
           return this.agentWatchers[agent.id]
         }
         // Otherwise create a new watcher.
-        const watcher = monitorMetadata(agent.id, url, token2)
+        const watcher = monitorMetadata(agent.id, restClient)
         watcher.onChange(() => this.refresh())
         this.agentWatchers[agent.id] = watcher
         return watcher
@@ -139,11 +152,15 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
 
   /**
    * Either start or stop the refresh timer based on visibility.
+   *
+   * If we have never fetched workspaces and are visible, fetch immediately.
    */
   setVisibility(visible: boolean) {
     this.visible = visible
     if (!visible) {
       this.cancelPendingRefresh()
+    } else if (!this.workspaces) {
+      this.fetchAndRefresh()
     } else {
       this.maybeScheduleRefresh()
     }
@@ -201,14 +218,17 @@ export class WorkspaceProvider implements vscode.TreeDataProvider<vscode.TreeIte
 
       return Promise.resolve([])
     }
-    return Promise.resolve(this.workspaces)
+    return Promise.resolve(this.workspaces || [])
   }
 }
 
 // monitorMetadata opens an SSE endpoint to monitor metadata on the specified
 // agent and registers a watcher that can be disposed to stop the watch and
 // emits an event when the metadata changes.
-function monitorMetadata(agentId: WorkspaceAgent["id"], url: string, token: string): AgentWatcher {
+function monitorMetadata(agentId: WorkspaceAgent["id"], restClient: Api): AgentWatcher {
+  // TODO: Is there a better way to grab the url and token?
+  const url = restClient.getAxiosInstance().defaults.baseURL
+  const token = restClient.getAxiosInstance().defaults.headers.common["Coder-Session-Token"] as string | undefined
   const metadataUrl = new URL(`${url}/api/v2/workspaceagents/${agentId}/watch-metadata`)
   const eventSource = new EventSource(metadataUrl.toString(), {
     headers: {
@@ -273,6 +293,7 @@ export class OpenableTreeItem extends vscode.TreeItem {
   constructor(
     label: string,
     tooltip: string,
+    description: string,
     collapsibleState: vscode.TreeItemCollapsibleState,
 
     public readonly workspaceOwner: string,
@@ -285,6 +306,7 @@ export class OpenableTreeItem extends vscode.TreeItem {
     super(label, collapsibleState)
     this.contextValue = contextValue
     this.tooltip = tooltip
+    this.description = description
   }
 
   iconPath = {
@@ -300,11 +322,10 @@ class AgentTreeItem extends OpenableTreeItem {
     workspaceName: string,
     watchMetadata = false,
   ) {
-    const label = agent.name
-    const detail = `Status: ${agent.status}`
     super(
-      label,
-      detail,
+      agent.name, // label
+      `Status: ${agent.status}`, // tooltip
+      agent.status, // description
       watchMetadata ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
       workspaceOwner,
       workspaceName,
@@ -330,6 +351,7 @@ export class WorkspaceTreeItem extends OpenableTreeItem {
     super(
       label,
       detail,
+      workspace.latest_build.status, // description
       showOwner ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.Expanded,
       workspace.owner_name,
       workspace.name,

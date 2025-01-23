@@ -1,16 +1,6 @@
 import { isAxiosError } from "axios"
-import {
-  getBuildInfo,
-  getTemplate,
-  getWorkspace,
-  getWorkspaceBuildLogs,
-  getWorkspaceByOwnerAndName,
-  startWorkspace,
-  getDeploymentSSHConfig,
-  getTemplateVersion,
-} from "coder/site/src/api/api"
-import { ProvisionerJobLog, Workspace, WorkspaceAgent } from "coder/site/src/api/typesGenerated"
-import EventSource from "eventsource"
+import { Api } from "coder/site/src/api/api"
+import { Workspace } from "coder/site/src/api/typesGenerated"
 import find from "find-process"
 import * as fs from "fs/promises"
 import * as jsonc from "jsonc-parser"
@@ -19,52 +9,246 @@ import * as path from "path"
 import prettyBytes from "pretty-bytes"
 import * as semver from "semver"
 import * as vscode from "vscode"
-import * as ws from "ws"
+import { makeCoderSdk, needToken, startWorkspaceIfStoppedOrFailed, waitForBuild } from "./api"
+import { extractAgents } from "./api-helper"
+import * as cli from "./cliManager"
+import { Commands } from "./commands"
+import { featureSetForVersion, FeatureSet } from "./featureSet"
 import { getHeaderCommand } from "./headers"
-import { SSHConfig, SSHValues, defaultSSHConfigResponse, mergeSSHConfigValues } from "./sshConfig"
+import { SSHConfig, SSHValues, mergeSSHConfigValues } from "./sshConfig"
 import { computeSSHProperties, sshSupportsSetEnv } from "./sshSupport"
 import { Storage } from "./storage"
-import { supportsCoderAgentLogDirFlag } from "./version"
-import { WorkspaceAction } from "./workspaceAction"
+import { AuthorityPrefix, expandPath, parseRemoteAuthority } from "./util"
+import { WorkspaceMonitor } from "./workspaceMonitor"
+
+export interface RemoteDetails extends vscode.Disposable {
+  url: string
+  token: string
+}
 
 export class Remote {
-  // Prefix is a magic string that is prepended to SSH hosts to indicate that
-  // they should be handled by this extension.
-  public static readonly Prefix = "coder-vscode--"
-
   public constructor(
+    // We use the proposed API to get access to useCustom in dialogs.
     private readonly vscodeProposed: typeof vscode,
     private readonly storage: Storage,
+    private readonly commands: Commands,
     private readonly mode: vscode.ExtensionMode,
   ) {}
 
-  public async setup(remoteAuthority: string): Promise<vscode.Disposable | undefined> {
-    const authorityParts = remoteAuthority.split("+")
-    // If the URI passed doesn't have the proper prefix ignore it. We don't need
-    // to do anything special, because this isn't trying to open a Coder
-    // workspace.
-    if (!authorityParts[1].startsWith(Remote.Prefix)) {
+  private async confirmStart(workspaceName: string): Promise<boolean> {
+    const action = await this.vscodeProposed.window.showInformationMessage(
+      `Unable to connect to the workspace ${workspaceName} because it is not running. Start the workspace?`,
+      {
+        useCustom: true,
+        modal: true,
+      },
+      "Start",
+    )
+    return action === "Start"
+  }
+
+  /**
+   * Try to get the workspace running.  Return undefined if the user canceled.
+   */
+  private async maybeWaitForRunning(
+    restClient: Api,
+    workspace: Workspace,
+    label: string,
+    binPath: string,
+  ): Promise<Workspace | undefined> {
+    // Maybe already running?
+    if (workspace.latest_build.status === "running") {
+      return workspace
+    }
+
+    const workspaceName = `${workspace.owner_name}/${workspace.name}`
+
+    // A terminal will be used to stream the build, if one is necessary.
+    let writeEmitter: undefined | vscode.EventEmitter<string>
+    let terminal: undefined | vscode.Terminal
+    let attempts = 0
+
+    function initWriteEmitterAndTerminal(): vscode.EventEmitter<string> {
+      if (!writeEmitter) {
+        writeEmitter = new vscode.EventEmitter<string>()
+      }
+      if (!terminal) {
+        terminal = vscode.window.createTerminal({
+          name: "Build Log",
+          location: vscode.TerminalLocation.Panel,
+          // Spin makes this gear icon spin!
+          iconPath: new vscode.ThemeIcon("gear~spin"),
+          pty: {
+            onDidWrite: writeEmitter.event,
+            close: () => undefined,
+            open: () => undefined,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as Partial<vscode.Pseudoterminal> as any,
+        })
+        terminal.show(true)
+      }
+      return writeEmitter
+    }
+
+    try {
+      // Show a notification while we wait.
+      return await this.vscodeProposed.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          cancellable: false,
+          title: "Waiting for workspace build...",
+        },
+        async () => {
+          const globalConfigDir = path.dirname(this.storage.getSessionTokenPath(label))
+          while (workspace.latest_build.status !== "running") {
+            ++attempts
+            switch (workspace.latest_build.status) {
+              case "pending":
+              case "starting":
+              case "stopping":
+                writeEmitter = initWriteEmitterAndTerminal()
+                this.storage.writeToCoderOutputChannel(`Waiting for ${workspaceName}...`)
+                workspace = await waitForBuild(restClient, writeEmitter, workspace)
+                break
+              case "stopped":
+                if (!(await this.confirmStart(workspaceName))) {
+                  return undefined
+                }
+                writeEmitter = initWriteEmitterAndTerminal()
+                this.storage.writeToCoderOutputChannel(`Starting ${workspaceName}...`)
+                workspace = await startWorkspaceIfStoppedOrFailed(
+                  restClient,
+                  globalConfigDir,
+                  binPath,
+                  workspace,
+                  writeEmitter,
+                )
+                break
+              case "failed":
+                // On a first attempt, we will try starting a failed workspace
+                // (for example canceling a start seems to cause this state).
+                if (attempts === 1) {
+                  if (!(await this.confirmStart(workspaceName))) {
+                    return undefined
+                  }
+                  writeEmitter = initWriteEmitterAndTerminal()
+                  this.storage.writeToCoderOutputChannel(`Starting ${workspaceName}...`)
+                  workspace = await startWorkspaceIfStoppedOrFailed(
+                    restClient,
+                    globalConfigDir,
+                    binPath,
+                    workspace,
+                    writeEmitter,
+                  )
+                  break
+                }
+              // Otherwise fall through and error.
+              case "canceled":
+              case "canceling":
+              case "deleted":
+              case "deleting":
+              default: {
+                const is = workspace.latest_build.status === "failed" ? "has" : "is"
+                throw new Error(`${workspaceName} ${is} ${workspace.latest_build.status}`)
+              }
+            }
+            this.storage.writeToCoderOutputChannel(`${workspaceName} status is now ${workspace.latest_build.status}`)
+          }
+          return workspace
+        },
+      )
+    } finally {
+      if (writeEmitter) {
+        writeEmitter.dispose()
+      }
+      if (terminal) {
+        terminal.dispose()
+      }
+    }
+  }
+
+  /**
+   * Ensure the workspace specified by the remote authority is ready to receive
+   * SSH connections.  Return undefined if the authority is not for a Coder
+   * workspace or when explicitly closing the remote.
+   */
+  public async setup(remoteAuthority: string): Promise<RemoteDetails | undefined> {
+    const parts = parseRemoteAuthority(remoteAuthority)
+    if (!parts) {
+      // Not a Coder host.
       return
     }
-    const sshAuthority = authorityParts[1].substring(Remote.Prefix.length)
 
-    // Authorities are in the format:
-    // coder-vscode--<username>--<workspace>--<agent> Agent can be omitted then
-    // will be prompted for instead.
-    const parts = sshAuthority.split("--")
-    if (parts.length < 2 || parts.length > 3) {
-      throw new Error(`Invalid Coder SSH authority. Must be: <username>--<workspace>--<agent?>`)
+    const workspaceName = `${parts.username}/${parts.workspace}`
+
+    // Migrate "session_token" file to "session", if needed.
+    await this.storage.migrateSessionToken(parts.label)
+
+    // Get the URL and token belonging to this host.
+    const { url: baseUrlRaw, token } = await this.storage.readCliConfig(parts.label)
+
+    // It could be that the cli config was deleted.  If so, ask for the url.
+    if (!baseUrlRaw || (!token && needToken())) {
+      const result = await this.vscodeProposed.window.showInformationMessage(
+        "You are not logged in...",
+        {
+          useCustom: true,
+          modal: true,
+          detail: `You must log in to access ${workspaceName}.`,
+        },
+        "Log In",
+      )
+      if (!result) {
+        // User declined to log in.
+        await this.closeRemote()
+      } else {
+        // Log in then try again.
+        await vscode.commands.executeCommand("coder.login", baseUrlRaw, undefined, parts.label)
+        await this.setup(remoteAuthority)
+      }
+      return
     }
 
-    const buildInfo = await getBuildInfo()
-    const parsedVersion = semver.parse(buildInfo.version)
+    this.storage.writeToCoderOutputChannel(`Using deployment URL: ${baseUrlRaw}`)
+    this.storage.writeToCoderOutputChannel(`Using deployment label: ${parts.label || "n/a"}`)
+
+    // We could use the plugin client, but it is possible for the user to log
+    // out or log into a different deployment while still connected, which would
+    // break this connection.  We could force close the remote session or
+    // disallow logging out/in altogether, but for now just use a separate
+    // client to remain unaffected by whatever the plugin is doing.
+    const workspaceRestClient = await makeCoderSdk(baseUrlRaw, token, this.storage)
+    // Store for use in commands.
+    this.commands.workspaceRestClient = workspaceRestClient
+
+    let binaryPath: string | undefined
+    if (this.mode === vscode.ExtensionMode.Production) {
+      binaryPath = await this.storage.fetchBinary(workspaceRestClient, parts.label)
+    } else {
+      try {
+        // In development, try to use `/tmp/coder` as the binary path.
+        // This is useful for debugging with a custom bin!
+        binaryPath = path.join(os.tmpdir(), "coder")
+        await fs.stat(binaryPath)
+      } catch (ex) {
+        binaryPath = await this.storage.fetchBinary(workspaceRestClient, parts.label)
+      }
+    }
+
+    // First thing is to check the version.
+    const buildInfo = await workspaceRestClient.getBuildInfo()
+
+    let version: semver.SemVer | null = null
+    try {
+      version = semver.parse(await cli.version(binaryPath))
+    } catch (e) {
+      version = semver.parse(buildInfo.version)
+    }
+
+    const featureSet = featureSetForVersion(version)
+
     // Server versions before v0.14.1 don't support the vscodessh command!
-    if (
-      parsedVersion?.major === 0 &&
-      parsedVersion?.minor <= 14 &&
-      parsedVersion?.patch < 1 &&
-      parsedVersion?.prerelease.length === 0
-    ) {
+    if (!featureSet.vscodessh) {
       await this.vscodeProposed.window.showErrorMessage(
         "Incompatible Server",
         {
@@ -77,11 +261,16 @@ export class Remote {
       await this.closeRemote()
       return
     }
-    const hasCoderLogs = supportsCoderAgentLogDirFlag(parsedVersion)
 
-    // Find the workspace from the URI scheme provided!
+    // Next is to find the workspace from the URI scheme provided.
+    let workspace: Workspace
     try {
-      this.storage.workspace = await getWorkspaceByOwnerAndName(parts[0], parts[1])
+      this.storage.writeToCoderOutputChannel(`Looking for workspace ${workspaceName}...`)
+      workspace = await workspaceRestClient.getWorkspaceByOwnerAndName(parts.username, parts.workspace)
+      this.storage.writeToCoderOutputChannel(
+        `Found workspace ${workspaceName} with status ${workspace.latest_build.status}`,
+      )
+      this.commands.workspace = workspace
     } catch (error) {
       if (!isAxiosError(error)) {
         throw error
@@ -92,7 +281,7 @@ export class Remote {
             `That workspace doesn't exist!`,
             {
               modal: true,
-              detail: `${parts[0]}/${parts[1]} cannot be found. Maybe it was deleted...`,
+              detail: `${workspaceName} cannot be found on ${baseUrlRaw}. Maybe it was deleted...`,
               useCustom: true,
             },
             "Open Workspace",
@@ -109,14 +298,14 @@ export class Remote {
             {
               useCustom: true,
               modal: true,
-              detail: "You must login again to access your workspace.",
+              detail: `You must log in to access ${workspaceName}.`,
             },
-            "Login",
+            "Log In",
           )
           if (!result) {
             await this.closeRemote()
           } else {
-            await vscode.commands.executeCommand("coder.login", this.storage.getURL())
+            await vscode.commands.executeCommand("coder.login", baseUrlRaw, undefined, parts.label)
             await this.setup(remoteAuthority)
           }
           return
@@ -128,156 +317,30 @@ export class Remote {
 
     const disposables: vscode.Disposable[] = []
     // Register before connection so the label still displays!
-    disposables.push(
-      this.registerLabelFormatter(remoteAuthority, this.storage.workspace.owner_name, this.storage.workspace.name),
-    )
+    disposables.push(this.registerLabelFormatter(remoteAuthority, workspace.owner_name, workspace.name))
 
-    // Initialize any WorkspaceAction notifications (auto-off, upcoming deletion)
-    const action = await WorkspaceAction.init(this.vscodeProposed, this.storage)
-
-    let buildComplete: undefined | (() => void)
-    if (this.storage.workspace.latest_build.status === "stopped") {
-      // If the workspace requires the latest active template version, we should attempt
-      // to update that here.
-      // TODO: If param set changes, what do we do??
-      const versionID = this.storage.workspace.template_require_active_version
-        ? // Use the latest template version
-          this.storage.workspace.template_active_version_id
-        : // Default to not updating the workspace if not required.
-          this.storage.workspace.latest_build.template_version_id
-
-      this.vscodeProposed.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          cancellable: false,
-          title: this.storage.workspace.template_require_active_version
-            ? "Updating workspace..."
-            : "Starting workspace...",
-        },
-        () =>
-          new Promise<void>((r) => {
-            buildComplete = r
-          }),
-      )
-
-      const latestBuild = await startWorkspace(this.storage.workspace.id, versionID)
-      this.storage.workspace = {
-        ...this.storage.workspace,
-        latest_build: latestBuild,
-      }
+    // If the workspace is not in a running state, try to get it running.
+    const updatedWorkspace = await this.maybeWaitForRunning(workspaceRestClient, workspace, parts.label, binaryPath)
+    if (!updatedWorkspace) {
+      // User declined to start the workspace.
+      await this.closeRemote()
+      return
     }
+    this.commands.workspace = workspace = updatedWorkspace
 
-    // If a build is running we should stream the logs to the user so they can
-    // watch what's going on!
-    if (
-      this.storage.workspace.latest_build.status === "pending" ||
-      this.storage.workspace.latest_build.status === "starting" ||
-      this.storage.workspace.latest_build.status === "stopping"
-    ) {
-      const writeEmitter = new vscode.EventEmitter<string>()
-      // We use a terminal instead of an output channel because it feels more
-      // familiar to a user!
-      const terminal = vscode.window.createTerminal({
-        name: "Build Log",
-        location: vscode.TerminalLocation.Panel,
-        // Spin makes this gear icon spin!
-        iconPath: new vscode.ThemeIcon("gear~spin"),
-        pty: {
-          onDidWrite: writeEmitter.event,
-          close: () => undefined,
-          open: () => undefined,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        } as Partial<vscode.Pseudoterminal> as any,
-      })
-      // This fetches the initial bunch of logs.
-      const logs = await getWorkspaceBuildLogs(this.storage.workspace.latest_build.id, new Date())
-      logs.forEach((log) => writeEmitter.fire(log.output + "\r\n"))
-      terminal.show(true)
-      // This follows the logs for new activity!
-      let path = `/api/v2/workspacebuilds/${this.storage.workspace.latest_build.id}/logs?follow=true`
-      if (logs.length) {
-        path += `&after=${logs[logs.length - 1].id}`
-      }
-      const rawURL = this.storage.getURL()
-      if (!rawURL) {
-        throw new Error("You aren't logged in!")
-      }
-      const url = new URL(rawURL)
-      const sessionToken = await this.storage.getSessionToken()
-      await new Promise<void>((resolve, reject) => {
-        let scheme = "wss:"
-        if (url.protocol === "http:") {
-          scheme = "ws:"
-        }
-        const socket = new ws.WebSocket(new URL(`${scheme}//${url.host}${path}`), {
-          headers: {
-            "Coder-Session-Token": sessionToken,
-          },
-        })
-        socket.binaryType = "nodebuffer"
-        socket.on("message", (data) => {
-          const buf = data as Buffer
-          const log = JSON.parse(buf.toString()) as ProvisionerJobLog
-          writeEmitter.fire(log.output + "\r\n")
-        })
-        socket.on("error", (err) => {
-          reject(err)
-        })
-        socket.on("close", () => {
-          resolve()
-        })
-      })
-      writeEmitter.fire("Build complete")
-      this.storage.workspace = await getWorkspace(this.storage.workspace.id)
-      terminal.dispose()
-
-      if (buildComplete) {
-        buildComplete()
-      }
-
-      if (this.storage.workspace.latest_build.status === "stopped") {
-        const result = await this.vscodeProposed.window.showInformationMessage(
-          `This workspace is stopped!`,
-          {
-            modal: true,
-            detail: `Click below to start and open ${parts[0]}/${parts[1]}.`,
-            useCustom: true,
-          },
-          "Start Workspace",
-        )
-        if (!result) {
-          await this.closeRemote()
-        }
-        await this.reloadWindow()
-        return
-      }
+    // Pick an agent.
+    this.storage.writeToCoderOutputChannel(`Finding agent for ${workspaceName}...`)
+    const gotAgent = await this.commands.maybeAskAgent(workspace, parts.agent)
+    if (!gotAgent) {
+      // User declined to pick an agent.
+      await this.closeRemote()
+      return
     }
+    let agent = gotAgent // Reassign so it cannot be undefined in callbacks.
+    this.storage.writeToCoderOutputChannel(`Found agent ${agent.name} with status ${agent.status}`)
 
-    const agents = this.storage.workspace.latest_build.resources.reduce((acc, resource) => {
-      return acc.concat(resource.agents || [])
-    }, [] as WorkspaceAgent[])
-
-    let agent: WorkspaceAgent | undefined
-
-    if (parts.length === 2) {
-      if (agents.length === 1) {
-        agent = agents[0]
-      }
-
-      // If there are multiple agents, we should select one here! TODO: Support
-      // multiple agents!
-    }
-
-    if (!agent) {
-      const matchingAgents = agents.filter((agent) => agent.name === parts[2])
-      if (matchingAgents.length !== 1) {
-        // TODO: Show the agent selector here instead!
-        throw new Error(`Invalid Coder SSH authority. Agent not found!`)
-      }
-      agent = matchingAgents[0]
-    }
-
-    const hostname = authorityParts[1]
+    // Do some janky setting manipulation.
+    this.storage.writeToCoderOutputChannel("Modifying settings...")
     const remotePlatforms = this.vscodeProposed.workspace
       .getConfiguration()
       .get<Record<string, string>>("remote.SSH.remotePlatform", {})
@@ -300,8 +363,8 @@ export class Remote {
     // Add the remote platform for this host to bypass a step where VS Code asks
     // the user for the platform.
     let mungedPlatforms = false
-    if (!remotePlatforms[hostname] || remotePlatforms[hostname] !== agent.operating_system) {
-      remotePlatforms[hostname] = agent.operating_system
+    if (!remotePlatforms[parts.host] || remotePlatforms[parts.host] !== agent.operating_system) {
+      remotePlatforms[parts.host] = agent.operating_system
       settingsContent = jsonc.applyEdits(
         settingsContent,
         jsonc.modify(settingsContent, ["remote.SSH.remotePlatform"], remotePlatforms, {}),
@@ -313,8 +376,7 @@ export class Remote {
     // of 15 seconds, which can be too short in the case where we wait for
     // startup scripts.  For now we hardcode a longer value.  Because this is
     // potentially overwriting user configuration, it feels a bit sketchy.  If
-    // microsoft/vscode-remote-release#8519 is resolved we can remove this but
-    // for now to mitigate the sketchiness we will reset it after connecting.
+    // microsoft/vscode-remote-release#8519 is resolved we can remove this.
     const minConnTimeout = 1800
     let mungedConnTimeout = false
     if (!connTimeout || connTimeout < minConnTimeout) {
@@ -334,92 +396,18 @@ export class Remote {
         // write here is not necessarily catastrophic since the user will be
         // asked for the platform and the default timeout might be sufficient.
         mungedPlatforms = mungedConnTimeout = false
+        this.storage.writeToCoderOutputChannel(`Failed to configure settings: ${ex}`)
       }
     }
 
-    const workspaceUpdate = new vscode.EventEmitter<Workspace>()
-    const watchURL = new URL(`${this.storage.getURL()}/api/v2/workspaces/${this.storage.workspace.id}/watch`)
-    const eventSource = new EventSource(watchURL.toString(), {
-      headers: {
-        "Coder-Session-Token": await this.storage.getSessionToken(),
-      },
-    })
+    // Watch the workspace for changes.
+    const monitor = new WorkspaceMonitor(workspace, workspaceRestClient, this.storage, this.vscodeProposed)
+    disposables.push(monitor)
+    disposables.push(monitor.onChange.event((w) => (this.commands.workspace = w)))
 
-    const workspaceUpdatedStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 999)
-    disposables.push(workspaceUpdatedStatus)
-
-    let hasShownOutdatedNotification = false
-    const refreshWorkspaceUpdatedStatus = (newWorkspace: Workspace) => {
-      // If the newly gotten workspace was updated, then we show a notification
-      // to the user that they should update.
-      if (newWorkspace.outdated) {
-        if (!this.storage.workspace?.outdated || !hasShownOutdatedNotification) {
-          hasShownOutdatedNotification = true
-          getTemplate(newWorkspace.template_id)
-            .then((template) => {
-              return getTemplateVersion(template.active_version_id)
-            })
-            .then((version) => {
-              let infoMessage = `A new version of your workspace is available.`
-              if (version.message) {
-                infoMessage = `A new version of your workspace is available: ${version.message}`
-              }
-              vscode.window.showInformationMessage(infoMessage, "Update").then((action) => {
-                if (action === "Update") {
-                  vscode.commands.executeCommand("coder.workspace.update", newWorkspace)
-                }
-              })
-            })
-        }
-      }
-      if (!newWorkspace.outdated) {
-        vscode.commands.executeCommand("setContext", "coder.workspace.updatable", false)
-        workspaceUpdatedStatus.hide()
-        return
-      }
-      workspaceUpdatedStatus.name = "Coder Workspace Update"
-      workspaceUpdatedStatus.text = "$(fold-up) Update Workspace"
-      workspaceUpdatedStatus.command = "coder.workspace.update"
-      // Important for hiding the "Update Workspace" command.
-      vscode.commands.executeCommand("setContext", "coder.workspace.updatable", true)
-      workspaceUpdatedStatus.show()
-    }
-    // Show an initial status!
-    refreshWorkspaceUpdatedStatus(this.storage.workspace)
-
-    eventSource.addEventListener("data", (event: MessageEvent<string>) => {
-      const workspace = JSON.parse(event.data) as Workspace
-      if (!workspace) {
-        return
-      }
-      refreshWorkspaceUpdatedStatus(workspace)
-      this.storage.workspace = workspace
-      workspaceUpdate.fire(workspace)
-      if (workspace.latest_build.status === "stopping" || workspace.latest_build.status === "stopped") {
-        const action = this.vscodeProposed.window.showInformationMessage(
-          "Your workspace stopped!",
-          {
-            useCustom: true,
-            modal: true,
-            detail: "Reloading the window will start it again.",
-          },
-          "Reload Window",
-        )
-        if (!action) {
-          return
-        }
-        this.reloadWindow()
-      }
-      // If a new build is initialized for a workspace, we automatically
-      // reload the window. Then the build log will appear, and startup
-      // will continue as expected.
-      if (workspace.latest_build.status === "starting") {
-        this.reloadWindow()
-        return
-      }
-    })
-
+    // Wait for the agent to connect.
     if (agent.status === "connecting") {
+      this.storage.writeToCoderOutputChannel(`Waiting for ${workspaceName}/${agent.name}...`)
       await vscode.window.withProgress(
         {
           title: "Waiting for the agent to connect...",
@@ -427,18 +415,12 @@ export class Remote {
         },
         async () => {
           await new Promise<void>((resolve) => {
-            const updateEvent = workspaceUpdate.event((workspace) => {
-              const agents = workspace.latest_build.resources.reduce((acc, resource) => {
-                return acc.concat(resource.agents || [])
-              }, [] as WorkspaceAgent[])
+            const updateEvent = monitor.onChange.event((workspace) => {
               if (!agent) {
                 return
               }
+              const agents = extractAgents(workspace)
               const found = agents.find((newAgent) => {
-                if (!agent) {
-                  // This shouldn't be possible... just makes the types happy!
-                  return false
-                }
                 return newAgent.id === agent.id
               })
               if (!found) {
@@ -454,14 +436,20 @@ export class Remote {
           })
         },
       )
+      this.storage.writeToCoderOutputChannel(`Agent ${agent.name} status is now ${agent.status}`)
     }
 
-    if (agent.status === "timeout") {
-      const result = await this.vscodeProposed.window.showErrorMessage("Connection timed out...", {
-        useCustom: true,
-        modal: true,
-        detail: `The ${agent.name} agent didn't connect in time. Try restarting your workspace.`,
-      })
+    // Make sure the agent is connected.
+    // TODO: Should account for the lifecycle state as well?
+    if (agent.status !== "connected") {
+      const result = await this.vscodeProposed.window.showErrorMessage(
+        `${workspaceName}/${agent.name} ${agent.status}`,
+        {
+          useCustom: true,
+          modal: true,
+          detail: `The ${agent.name} agent failed to connect. Try restarting your workspace.`,
+        },
+      )
       if (!result) {
         await this.closeRemote()
         return
@@ -470,70 +458,84 @@ export class Remote {
       return
     }
 
+    const logDir = this.getLogDir(featureSet)
+
     // This ensures the Remote SSH extension resolves the host to execute the
     // Coder binary properly.
     //
     // If we didn't write to the SSH config file, connecting would fail with
     // "Host not found".
     try {
-      await this.updateSSHConfig(authorityParts[1], hasCoderLogs)
+      this.storage.writeToCoderOutputChannel("Updating SSH config...")
+      await this.updateSSHConfig(workspaceRestClient, parts.label, parts.host, binaryPath, logDir)
     } catch (error) {
-      // TODO: This is a bit weird, because even if we throw an error VS Code
-      // still tries to connect.  Can we stop it?
       this.storage.writeToCoderOutputChannel(`Failed to configure SSH: ${error}`)
       throw error
     }
 
+    // TODO: This needs to be reworked; it fails to pick up reconnects.
     this.findSSHProcessID().then((pid) => {
-      // Once the SSH process has spawned we can reset the timeout.
-      if (mungedConnTimeout) {
-        // Re-read settings in case they changed.
-        fs.readFile(this.storage.getUserSettingsPath(), "utf8").then(async (rawSettings) => {
-          try {
-            await fs.writeFile(
-              this.storage.getUserSettingsPath(),
-              jsonc.applyEdits(rawSettings, jsonc.modify(rawSettings, ["remote.SSH.connectTimeout"], connTimeout, {})),
-            )
-          } catch (error) {
-            this.storage.writeToCoderOutputChannel(
-              `Failed to reset remote.SSH.connectTimeout back to ${connTimeout}: ${error}`,
-            )
-          }
-        })
-      }
-
       if (!pid) {
         // TODO: Show an error here!
         return
       }
       disposables.push(this.showNetworkUpdates(pid))
-      this.storage.workspaceLogPath = path.join(this.storage.getLogPath(), `${pid}.log`)
+      this.commands.workspaceLogPath = logDir ? path.join(logDir, `${pid}.log`) : undefined
     })
 
     // Register the label formatter again because SSH overrides it!
-    const workspace = this.storage.workspace
-    const agentName = agents.length > 1 ? agent.name : undefined
     disposables.push(
       vscode.extensions.onDidChange(() => {
-        disposables.push(this.registerLabelFormatter(remoteAuthority, workspace.owner_name, workspace.name, agentName))
+        disposables.push(this.registerLabelFormatter(remoteAuthority, workspace.owner_name, workspace.name, agent.name))
       }),
     )
 
+    this.storage.writeToCoderOutputChannel("Remote setup complete")
+
+    // Returning the URL and token allows the plugin to authenticate its own
+    // client, for example to display the list of workspaces belonging to this
+    // deployment in the sidebar.  We use our own client in here for reasons
+    // explained above.
     return {
+      url: baseUrlRaw,
+      token,
       dispose: () => {
-        eventSource.close()
-        action.cleanupWorkspaceActions()
         disposables.forEach((d) => d.dispose())
       },
     }
   }
 
+  /**
+   * Return the --log-dir argument value for the ProxyCommand.  It may be an
+   * empty string if the setting is not set or the cli does not support it.
+   */
+  private getLogDir(featureSet: FeatureSet): string {
+    if (!featureSet.proxyLogDirectory) {
+      return ""
+    }
+    // If the proxyLogDirectory is not set in the extension settings we don't send one.
+    return expandPath(String(vscode.workspace.getConfiguration().get("coder.proxyLogDirectory") ?? "").trim())
+  }
+
+  /**
+   * Formats the --log-dir argument for the ProxyCommand after making sure it
+   * has been created.
+   */
+  private async formatLogArg(logDir: string): Promise<string> {
+    if (!logDir) {
+      return ""
+    }
+    await fs.mkdir(logDir, { recursive: true })
+    this.storage.writeToCoderOutputChannel(`SSH proxy diagnostics are being written to ${logDir}`)
+    return ` --log-dir ${escape(logDir)}`
+  }
+
   // updateSSHConfig updates the SSH configuration with a wildcard that handles
   // all Coder entries.
-  private async updateSSHConfig(hostName: string, hasCoderLogs = false) {
-    let deploymentSSHConfig = defaultSSHConfigResponse
+  private async updateSSHConfig(restClient: Api, label: string, hostName: string, binaryPath: string, logDir: string) {
+    let deploymentSSHConfig = {}
     try {
-      const deploymentConfig = await getDeploymentSSHConfig()
+      const deploymentConfig = await restClient.getDeploymentSSHConfig()
       deploymentSSHConfig = deploymentConfig.ssh_config_options
     } catch (error) {
       if (!isAxiosError(error)) {
@@ -591,39 +593,29 @@ export class Remote {
     const sshConfig = new SSHConfig(sshConfigFile)
     await sshConfig.load()
 
-    let binaryPath: string | undefined
-    if (this.mode === vscode.ExtensionMode.Production) {
-      binaryPath = await this.storage.fetchBinary()
-    } else {
-      try {
-        // In development, try to use `/tmp/coder` as the binary path.
-        // This is useful for debugging with a custom bin!
-        binaryPath = path.join(os.tmpdir(), "coder")
-        await fs.stat(binaryPath)
-      } catch (ex) {
-        binaryPath = await this.storage.fetchBinary()
-      }
-    }
-
     const escape = (str: string): string => `"${str.replace(/"/g, '\\"')}"`
+    // Escape a command line to be executed by the Coder binary, so ssh doesn't substitute variables.
+    const escapeSubcommand: (str: string) => string =
+      os.platform() === "win32"
+        ? // On Windows variables are %VAR%, and we need to use double quotes.
+          (str) => escape(str).replace(/%/g, "%%")
+        : // On *nix we can use single quotes to escape $VARS.
+          // Note single quotes cannot be escaped inside single quotes.
+          (str) => `'${str.replace(/'/g, "'\\''")}'`
 
     // Add headers from the header command.
     let headerArg = ""
     const headerCommand = getHeaderCommand(vscode.workspace.getConfiguration())
     if (typeof headerCommand === "string" && headerCommand.trim().length > 0) {
-      headerArg = ` --header-command ${escape(headerCommand)}`
+      headerArg = ` --header-command ${escapeSubcommand(headerCommand)}`
     }
-    let logArg = ""
-    if (hasCoderLogs) {
-      await fs.mkdir(this.storage.getLogPath(), { recursive: true })
-      logArg = ` --log-dir ${escape(this.storage.getLogPath())}`
-    }
+
     const sshValues: SSHValues = {
-      Host: `${Remote.Prefix}*`,
+      Host: label ? `${AuthorityPrefix}.${label}--*` : `${AuthorityPrefix}--*`,
       ProxyCommand: `${escape(binaryPath)}${headerArg} vscodessh --network-info-dir ${escape(
         this.storage.getNetworkInfoPath(),
-      )}${logArg} --session-token-file ${escape(this.storage.getSessionTokenPath())} --url-file ${escape(
-        this.storage.getURLPath(),
+      )}${await this.formatLogArg(logDir)} --session-token-file ${escape(this.storage.getSessionTokenPath(label))} --url-file ${escape(
+        this.storage.getUrlPath(label),
       )} %h`,
       ConnectTimeout: "0",
       StrictHostKeyChecking: "no",
@@ -636,7 +628,7 @@ export class Remote {
       sshValues.SetEnv = " CODER_SSH_SESSION_TYPE=vscode"
     }
 
-    await sshConfig.update(sshValues, sshConfigOverrides)
+    await sshConfig.update(label, sshValues, sshConfigOverrides)
 
     // A user can provide a "Host *" entry in their SSH config to add options
     // to all hosts. We need to ensure that the options we set are not
@@ -688,7 +680,7 @@ export class Remote {
       } else {
         statusText += network.preferred_derp + " "
         networkStatus.tooltip =
-          "You're connected through a relay 🕵️.\nWe'll switch over to peer-to-peer when available."
+          "You're connected through a relay 🕵.\nWe'll switch over to peer-to-peer when available."
       }
       networkStatus.tooltip +=
         "\n\nDownload ↓ " +
@@ -704,9 +696,7 @@ export class Remote {
       if (!network.p2p) {
         const derpLatency = network.derp_latency[network.preferred_derp]
 
-        networkStatus.tooltip += `You ↔ ${derpLatency.toFixed(2)}ms ↔ ${network.preferred_derp} ↔ ${(
-          network.latency - derpLatency
-        ).toFixed(2)}ms ↔ Workspace`
+        networkStatus.tooltip += `You ↔ ${derpLatency.toFixed(2)}ms ↔ ${network.preferred_derp} ↔ ${(network.latency - derpLatency).toFixed(2)}ms ↔ Workspace`
 
         let first = true
         Object.keys(network.derp_latency).forEach((region) => {
